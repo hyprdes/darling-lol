@@ -10,6 +10,7 @@ import stat
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -85,6 +86,81 @@ class RuntimePackageTests(unittest.TestCase):
                          0o755)
         self.assertEqual(os.readlink(target / 'RuntimeFrameworks/Foo.framework/Foo'),
                          'Versions/Current/Foo')
+
+    def test_export_refuses_output_inside_runtime_including_symlink_aliases(self):
+        source = self.home / 'RuntimeLibraries/libGL.dylib'
+        alias = self.root / 'alias'
+        alias.symlink_to(self.home / 'RuntimeLibraries', target_is_directory=True)
+        outside = self.root / 'outside'
+        outside.write_bytes(b'outside')
+        inside_link = self.home / 'RuntimeLibraries/output-link'
+        inside_link.symlink_to(outside)
+        for output in (source, alias / 'new.tar.gz', inside_link):
+            with self.subTest(output=output), self.assertRaises(package_tool.PackageError):
+                package_tool.export(self.home, output, 'test')
+        self.assertEqual(source.read_bytes(), b'gl-bytes')
+        self.assertTrue(inside_link.is_symlink())
+        self.assertEqual(outside.read_bytes(), b'outside')
+
+    def test_export_rejects_special_permission_bits(self):
+        source = self.home / 'RuntimeLibraries/libGL.dylib'
+        source.chmod(0o4755)
+        with self.assertRaises(package_tool.PackageError):
+            package_tool.export(self.home, self.archive, 'test')
+        self.assertFalse(self.archive.exists())
+
+    def test_failed_export_preserves_existing_archive(self):
+        self.archive.write_bytes(b'previous archive')
+        with mock.patch.object(package_tool, 'add_bytes', side_effect=OSError('disk error')):
+            with self.assertRaises(OSError):
+                package_tool.export(self.home, self.archive, 'test')
+        self.assertEqual(self.archive.read_bytes(), b'previous archive')
+        self.assertEqual(list(self.root.glob('.runtime-export-*')), [])
+
+    def test_invalid_manifest_metadata_is_rejected_before_replacement(self):
+        target = self.root / 'target'
+        (target / 'RuntimeLibraries').mkdir(parents=True)
+        old = target / 'RuntimeLibraries/good'
+        old.write_bytes(b'old')
+        name = 'RuntimeLibraries/good'
+        entry = {'path': name, 'size': 3, 'sha256': hashlib.sha256(b'new').hexdigest(), 'mode': 0o644}
+        manifests = [None, [], {'schema': 1},
+                     {'schema': True, 'files': [], 'symlinks': []},
+                     {'schema': 1, 'files': [dict(entry, size=4)], 'symlinks': []},
+                     {'schema': 1, 'files': [dict(entry, mode=0o4755)], 'symlinks': []},
+                     {'schema': 1, 'files': [dict(entry, sha256='bad')], 'symlinks': []},
+                     {'schema': 1, 'files': [{}], 'symlinks': []},
+                     {'schema': 1, 'files': [], 'symlinks': [None]}]
+        for manifest in manifests:
+            # write_package treats None as its default, so construct JSON directly.
+            with tarfile.open(self.archive, 'w:gz') as archive:
+                package_tool.add_bytes(archive, package_tool.MANIFEST, json.dumps(manifest).encode())
+                package_tool.add_bytes(archive, name, b'new')
+            with self.subTest(manifest=manifest), self.assertRaises(package_tool.PackageError):
+                package_tool.install(self.archive, target, out=lambda _: None)
+            self.assertEqual(old.read_bytes(), b'old')
+
+    def test_archive_symlink_target_must_match_manifest(self):
+        name = 'RuntimeLibraries/link'
+        manifest = {'schema': 1, 'files': [], 'symlinks': [{'path': name, 'target': 'safe'}]}
+        write_package(self.archive, {}, {name: 'different'}, manifest)
+        with self.assertRaises(package_tool.PackageError):
+            package_tool.install(self.archive, self.root / 'target')
+        with self.assertRaises(package_tool.PackageError):
+            package_tool.describe(self.archive, out=lambda _: None)
+
+    def test_invalid_json_and_nonregular_manifest_are_rejected(self):
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            package_tool.add_bytes(archive, package_tool.MANIFEST, b'{invalid')
+        with self.assertRaises(package_tool.PackageError):
+            package_tool.describe(self.archive)
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            info = tarfile.TarInfo(package_tool.MANIFEST)
+            info.type = tarfile.SYMTYPE
+            info.linkname = 'other'
+            archive.addfile(info)
+        with self.assertRaises(package_tool.PackageError):
+            package_tool.describe(self.archive)
 
     def test_export_is_deterministic(self):
         first = self.root / 'first.tar.gz'
