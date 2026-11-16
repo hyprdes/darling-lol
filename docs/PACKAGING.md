@@ -24,7 +24,10 @@ python3 tools/runtime-package.py export \
 `--guest-home` overrides the guest home when the prefix holds more than one
 `Users/*` directory. The export is byte-for-byte reproducible for the same
 input: entries are sorted, ownership is fixed at root and timestamps come from
-`SOURCE_DATE_EPOCH` (default 0), so a package build can set it.
+`SOURCE_DATE_EPOCH` (default 0), so a package build can set it. The output must
+be outside both runtime trees, including through symlink aliases. Export writes
+to a temporary file and replaces the output only when the archive is complete;
+keep the runtime unchanged during export.
 
 ## Inspect and install elsewhere
 
@@ -51,6 +54,8 @@ The archive is untrusted input:
 - every path must stay inside `RuntimeLibraries` or `RuntimeFrameworks`, with no
   absolute paths, `..`, or backslashes;
 - every symlink must be relative and must resolve inside its own runtime root;
+- manifest structure, file sizes, permissions (without special bits), and
+  symlink targets are checked against archive entries;
 - every file hash is checked against the manifest before anything is moved into
   place, using a staging directory inside the destination;
 - the installer refuses to replace a directory, refuses a symlinked destination
@@ -61,6 +66,11 @@ A checksum mismatch, an unexpected member, or an escaping link aborts the
 install and leaves the existing overlay untouched. All entries and destination
 collisions are checked before replacement begins. Each replacement is atomic;
 an I/O failure during replacement can still leave a partially updated set.
+`inspect` checks structure and metadata but does not hash file contents; use
+`install --dry-run` to check the content hashes without installing. The hashes
+are stored in the archive itself and do not authenticate its publisher: obtain
+packages from a trusted source and verify any separately supplied signature or
+digest before installing.
 
 ## What this covers
 

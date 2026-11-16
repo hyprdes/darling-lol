@@ -147,6 +147,14 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_fetch_pin_older_than_advanced_remote_and_failed_retry(self):
+        # This fixture has no LFS objects. Stub the commands so the Git checkout
+        # regression is independent of the host's optional git-lfs installation.
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        lfs = bin_dir / 'git-lfs'
+        lfs.write_text('#!/bin/sh\nexit 0\n')
+        lfs.chmod(0o755)
+        self.env['PATH'] = str(bin_dir) + os.pathsep + self.env['PATH']
         (self.source / 'file').write_text('pinned')
         git(self.source, 'add', '.')
         git(self.source, 'commit', '-m', 'pin')

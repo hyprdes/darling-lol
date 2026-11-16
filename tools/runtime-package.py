@@ -27,6 +27,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
@@ -227,41 +228,55 @@ def add_bytes(archive, name, data, mode=0o644, mtime=0):
 
 
 def export(home, output, label):
+    output = Path(output)
+    output_paths = (output.resolve(), output.parent.resolve() / output.name)
+    for root in ROOTS:
+        runtime_root = (Path(home) / root).resolve()
+        if any(path == runtime_root or runtime_root in path.parents for path in output_paths):
+            raise PackageError('output must be outside runtime roots: %s' % output)
     directories, files, links = collect(home)
     manifest = build_manifest(home, files, links, label)
+    for entry in manifest['files']:
+        if entry['mode'] & ~0o777:
+            raise PackageError('special permission bits on runtime file: %s' % entry['path'])
     check_links(manifest['symlinks'])
     data = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
     stamp = int(os.environ.get('SOURCE_DATE_EPOCH', '0') or 0)
-    output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, 'wb') as raw:
-        with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=stamp) as gz:
-            with tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as archive:
-                add_bytes(archive, MANIFEST, data, mtime=stamp)
-                for directory in sorted(directories):
-                    info = tarfile.TarInfo(directory)
-                    info.type = tarfile.DIRTYPE
-                    info.mode = 0o755
-                    info.mtime = stamp
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ''
-                    archive.addfile(info)
-                for entry in manifest['symlinks']:
-                    info = tarfile.TarInfo(entry['path'])
-                    info.type = tarfile.SYMTYPE
-                    info.linkname = entry['target']
-                    info.mtime = stamp
-                    info.uid = info.gid = 0
-                    archive.addfile(info)
-                for entry in manifest['files']:
-                    info = tarfile.TarInfo(entry['path'])
-                    info.size = entry['size']
-                    info.mode = entry['mode']
-                    info.mtime = stamp
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ''
-                    with open(home / entry['path'], 'rb') as source:
-                        archive.addfile(info, source)
+    fd, temporary = tempfile.mkstemp(prefix='.runtime-export-', dir=output.parent)
+    try:
+        with os.fdopen(fd, 'wb') as raw:
+            with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=stamp) as gz:
+                with tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as archive:
+                    add_bytes(archive, MANIFEST, data, mtime=stamp)
+                    for directory in sorted(directories):
+                        info = tarfile.TarInfo(directory)
+                        info.type = tarfile.DIRTYPE
+                        info.mode = 0o755
+                        info.mtime = stamp
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ''
+                        archive.addfile(info)
+                    for entry in manifest['symlinks']:
+                        info = tarfile.TarInfo(entry['path'])
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = entry['target']
+                        info.mtime = stamp
+                        info.uid = info.gid = 0
+                        archive.addfile(info)
+                    for entry in manifest['files']:
+                        info = tarfile.TarInfo(entry['path'])
+                        info.size = entry['size']
+                        info.mode = entry['mode']
+                        info.mtime = stamp
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ''
+                        with open(home / entry['path'], 'rb') as source:
+                            archive.addfile(info, source)
+        os.replace(temporary, output)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return manifest
 
 
@@ -277,7 +292,12 @@ def read_package(package):
             member = archive.getmember(MANIFEST)
         except KeyError:
             raise PackageError('no %s in %s' % (MANIFEST, package))
-        manifest = json.loads(archive.extractfile(member).read().decode())
+        if not member.isreg():
+            raise PackageError('manifest is not a regular file')
+        try:
+            manifest = json.loads(archive.extractfile(member).read().decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PackageError('invalid package manifest: %s' % error) from error
         members = {}
         seen = set()
         for item in archive.getmembers():
@@ -293,16 +313,28 @@ def read_package(package):
 
 
 def validate(manifest, members):
-    if manifest.get('schema') != SCHEMA:
+    if not isinstance(manifest, dict):
+        raise PackageError('package manifest must be an object')
+    if type(manifest.get('schema')) is not int or manifest['schema'] != SCHEMA:
         raise PackageError('unsupported package schema: %r' % manifest.get('schema'))
+    if not isinstance(manifest.get('files'), list) or not isinstance(manifest.get('symlinks'), list):
+        raise PackageError('manifest files and symlinks must be lists')
     expected = {}
-    for entry in manifest.get('files', []):
+    for entry in manifest['files']:
+        if (not isinstance(entry, dict) or not {'path', 'size', 'sha256', 'mode'} <= entry.keys()
+                or type(entry['size']) is not int or entry['size'] < 0
+                or type(entry['mode']) is not int or not 0 <= entry['mode'] <= 0o777
+                or not isinstance(entry['sha256'], str)
+                or not re.fullmatch(r'[0-9a-f]{64}', entry['sha256'])):
+            raise PackageError('invalid file manifest entry: %r' % entry)
         parts = safe_relative(entry['path'])
         key = '/'.join(parts)
         if key in expected:
             raise PackageError('duplicate manifest path: %s' % key)
         expected[key] = ('file', entry)
-    for entry in manifest.get('symlinks', []):
+    for entry in manifest['symlinks']:
+        if not isinstance(entry, dict) or not {'path', 'target'} <= entry.keys():
+            raise PackageError('invalid symlink manifest entry: %r' % entry)
         parts = safe_relative(entry['path'])
         check_link('/'.join(parts), entry['target'])
         key = '/'.join(parts)
@@ -332,6 +364,10 @@ def validate(manifest, members):
             raise PackageError('not a regular file: %s' % name)
         if kind == 'link' and not member.issym():
             raise PackageError('not a symlink: %s' % name)
+        if kind == 'file' and member.size != entry['size']:
+            raise PackageError('size mismatch: %s' % name)
+        if kind == 'link' and member.linkname != entry['target']:
+            raise PackageError('symlink target mismatch: %s' % name)
     check_links(manifest.get('symlinks', []))
     missing = sorted(set(expected) - set(members))
     if missing:
